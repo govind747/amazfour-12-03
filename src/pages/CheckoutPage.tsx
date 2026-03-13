@@ -184,11 +184,17 @@ const CheckoutPage: React.FC = () => {
         return;
       }
 
-      // Generate idempotency key for replay protection
+      // Check if user is still authenticated
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        throw new Error('Your session has expired. Please log in again.');
+      }
+
+      // Generate idempotency key
       const idempotencyKey = crypto.randomUUID();
       console.log('[Checkout] Idempotency key:', idempotencyKey);
 
-      // 1️⃣ Create Razorpay order with idempotency key
+      // 1️⃣ Create Razorpay order
       const { data, error } = await supabase.functions.invoke(
         "create-razorpay-order",
         {
@@ -201,19 +207,24 @@ const CheckoutPage: React.FC = () => {
             userId: userProfile.id,
             addressId: selectedAddress.id,
             shippingMethod: 'standard',
-            idempotencyKey, // Send to server
+            idempotencyKey,
             timestamp: Date.now()
           }
         }
       );
 
-      if (error || !data?.razorpayOrderId) {
-        throw new Error("Failed to create Razorpay order");
+      if (error) {
+        console.error('[Checkout] Create order error:', error);
+        throw new Error("Failed to create Razorpay order: " + error.message);
+      }
+
+      if (!data?.razorpayOrderId) {
+        throw new Error("Invalid Razorpay order response");
       }
 
       const { razorpayOrderId, amount, currency, orderReference, expiresAt } = data;
 
-      // Store in session storage for recovery
+      // Store in session storage
       sessionStorage.setItem('current_order', JSON.stringify({
         orderReference,
         razorpayOrderId,
@@ -222,7 +233,7 @@ const CheckoutPage: React.FC = () => {
         idempotencyKey
       }));
 
-      // 2️⃣ Configure Razorpay options with retry logic
+      // 2️⃣ Configure Razorpay options
       const options = {
         key: import.meta.env.VITE_RAZORPAY_KEY_ID,
         amount: amount,
@@ -231,7 +242,6 @@ const CheckoutPage: React.FC = () => {
         description: `Order #${orderReference}`,
         order_id: razorpayOrderId,
         
-        // ✅ Retry configuration
         retry: {
           enabled: true,
           max_count: 3
@@ -241,10 +251,45 @@ const CheckoutPage: React.FC = () => {
           console.log('[Checkout] Payment successful:', response);
           
           try {
-            // Show loading state
             setProcessingOrder(true);
 
-            // 3️⃣ Verify payment with idempotency
+            // Get fresh session
+            const { data: { session } } = await supabase.auth.getSession();
+            if (!session) {
+              throw new Error('Session expired');
+            }
+
+            // 1️⃣ FIRST - Create pending order in database
+            console.log('[Checkout] Creating pending order in database...');
+            const { data: pendingOrder, error: pendingError } = await supabase
+              .from('pending_orders')
+              .insert({
+                user_id: userProfile.id,
+                address_id: selectedAddress.id,
+                total_amount: total,
+                shipping_cost: shipping,
+                cart_items: cartItems.map(item => ({
+                  variant_id: item.variant_id,
+                  quantity: item.quantity,
+                  price: item.price_at_time
+                })),
+                order_reference: orderReference,
+                razorpay_order_id: razorpayOrderId,
+                idempotency_key: idempotencyKey,
+                expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString() // 30 minutes
+              })
+              .select()
+              .single();
+
+            if (pendingError) {
+              console.error('[Checkout] Error creating pending order:', pendingError);
+              throw new Error('Failed to create pending order');
+            }
+
+            console.log('[Checkout] Pending order created:', pendingOrder);
+
+            // 2️⃣ THEN - Verify payment with Razorpay
+            console.log('[Checkout] Verifying payment...');
             const { data: verifyData, error: verifyError } = await supabase.functions.invoke(
               "verify-razorpay-payment",
               {
@@ -253,52 +298,37 @@ const CheckoutPage: React.FC = () => {
                   razorpay_order_id: response.razorpay_order_id,
                   razorpay_signature: response.razorpay_signature,
                   orderReference: orderReference,
-                  idempotencyKey: idempotencyKey // Reuse same key
+                  idempotencyKey: idempotencyKey
                 }
               }
             );
 
             if (verifyError || !verifyData?.success) {
-              // Check if order was actually created (maybe by webhook)
-              const { data: existingOrder } = await supabase
-                .from('orders')
-                .select('id, order_reference')
-                .eq('order_reference', orderReference)
-                .single();
-
-              if (existingOrder) {
-                console.log('[Checkout] Order already created by webhook');
-                await clearCart();
-                navigate(`/order-success/${orderReference}`);
-                return;
-              }
-
-              throw new Error("Payment verification failed");
+              console.error('[Checkout] Verification failed:', verifyError);
+              
+              // Update pending order status to failed
+              await supabase
+                .from('pending_orders')
+                .update({ 
+                  status: 'failed',
+                  razorpay_payment_id: response.razorpay_payment_id
+                })
+                .eq('order_reference', orderReference);
+              
+              throw new Error('Payment verification failed');
             }
 
-            // 4️⃣ Clear cart and redirect
+            // 3️⃣ Clear cart and redirect
+            console.log('[Checkout] Payment verified, clearing cart...');
             await clearCart();
             sessionStorage.removeItem('current_order');
             navigate(`/order-success/${orderReference}`);
             
           } catch (err) {
             console.error("[Checkout] Post-payment error:", err);
-            
-            // Check order status via API
-            const { data: statusData } = await supabase.functions.invoke(
-              "check-order-status",
-              {
-                body: { orderReference }
-              }
-            );
-
-            if (statusData?.orderExists) {
-              // Order exists (webhook handled it)
-              await clearCart();
-              navigate(`/order-success/${orderReference}`);
-            } else {
-              alert("Payment successful but order confirmation delayed. We'll notify you via email.");
-            }
+            alert("Payment was successful but order confirmation failed. Our team will contact you soon.");
+          } finally {
+            setProcessingOrder(false);
           }
         },
 
@@ -307,8 +337,10 @@ const CheckoutPage: React.FC = () => {
             console.log('[Checkout] Payment modal dismissed');
             setProcessingOrder(false);
             
-            // Check if we need to cleanup
-            if (orderReference) {
+            // Check if order was already created (maybe by webhook)
+            const currentOrder = sessionStorage.getItem('current_order');
+            if (currentOrder) {
+              const { orderReference } = JSON.parse(currentOrder);
               checkPendingOrder(orderReference);
             }
           }
@@ -319,14 +351,15 @@ const CheckoutPage: React.FC = () => {
       
       razorpay.on('payment.failed', (response: any) => {
         console.error('[Checkout] Payment failed:', response.error);
-        handlePaymentFailure(response, orderReference, idempotencyKey);
+        alert('Payment failed: ' + response.error.description);
+        setProcessingOrder(false);
       });
       
       razorpay.open();
 
     } catch (error) {
       console.error("[Checkout] Payment error:", error);
-      alert("Payment could not be processed. Please try again.");
+      alert(error instanceof Error ? error.message : "Payment could not be processed. Please try again.");
     } finally {
       setLoading(false);
     }
