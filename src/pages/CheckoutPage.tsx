@@ -308,7 +308,9 @@ const CheckoutPage: React.FC = () => {
             setProcessingOrder(false);
             
             // Check if we need to cleanup
-            checkPendingOrder(orderReference);
+            if (orderReference) {
+              checkPendingOrder(orderReference);
+            }
           }
         }
       };
