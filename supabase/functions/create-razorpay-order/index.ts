@@ -94,14 +94,38 @@ serve(async (req) => {
     )
 
     // Verify signature
-    const body = razorpay_order_id + '|' + razorpay_payment_id
+    // Add this before signature verification
+    console.log('Verifying payment with:', {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature: razorpay_signature?.substring(0, 20) + '...',
+      secret_present: !!Deno.env.get('RAZORPAY_KEY_SECRET')
+    });
+
+    // Generate signature
+    const body = razorpay_order_id + '|' + razorpay_payment_id;
+    console.log('String to hash:', body);
+
     const expectedSignature = crypto
       .createHmac('sha256', Deno.env.get('RAZORPAY_KEY_SECRET')!)
       .update(body.toString())
-      .digest('hex')
+      .digest('hex');
+
+    console.log('Expected signature:', expectedSignature);
+    console.log('Received signature:', razorpay_signature);
+    console.log('Signatures match:', expectedSignature === razorpay_signature);
 
     if (expectedSignature !== razorpay_signature) {
-      throw new Error('Invalid signature')
+      console.error('Signature mismatch!');
+      return new Response(
+        JSON.stringify({ 
+          success: false, 
+          error: 'Invalid signature',
+          expected: expectedSignature.substring(0, 10) + '...',
+          received: razorpay_signature?.substring(0, 10) + '...'
+        }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
     }
 
     // Get pending order
