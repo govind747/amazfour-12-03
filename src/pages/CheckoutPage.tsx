@@ -248,101 +248,95 @@ const CheckoutPage: React.FC = () => {
         },
 
         handler: async (response: any) => {
-          console.log('[Checkout] Payment successful:', response);
-          
-          try {
-            setProcessingOrder(true);
+  console.log('[Checkout] Payment successful:', response);
+    
+    try {
+      setProcessingOrder(true);
 
-            // Get fresh session
-            const { data: { session } } = await supabase.auth.getSession();
-            if (!session) {
-              throw new Error('Session expired');
-            }
+      // Get fresh session
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        throw new Error('Session expired');
+      }
 
-            // 1️⃣ FIRST - Create pending order in database
-            console.log('[Checkout] Creating pending order in database...');
-            const { data: pendingOrder, error: pendingError } = await supabase
-              .from('pending_orders')
-              .insert({
-                user_id: userProfile.id,
-                address_id: selectedAddress.id,
-                total_amount: total,
-                shipping_cost: shipping,
-                cart_items: cartItems.map(item => ({
-                  variant_id: item.variant_id,
-                  quantity: item.quantity,
-                  price: item.price_at_time
-                })),
-                order_reference: orderReference,
-                razorpay_order_id: razorpayOrderId,
-                idempotency_key: idempotencyKey,
-                expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString() // 30 minutes
-              })
-              .select()
-              .single();
+      // 1️⃣ FIRST - Create the order in database (PENDING payment)
+      console.log('[Checkout] Creating order in database...');
+      const orderId = await createOrder();
+      if (!orderId) {
+        throw new Error('Failed to create order');
+      }
+      console.log('[Checkout] Order created with ID:', orderId);
 
-            if (pendingError) {
-              console.error('[Checkout] Error creating pending order:', pendingError);
-              throw new Error('Failed to create pending order');
-            }
+      // 2️⃣ Add order items
+      console.log('[Checkout] Adding order items...');
+      await addOrderItems(orderId);
+      console.log('[Checkout] Order items added');
 
-            console.log('[Checkout] Pending order created:', pendingOrder);
-
-            // 2️⃣ THEN - Verify payment with Razorpay
-            console.log('[Checkout] Verifying payment...');
-            const { data: verifyData, error: verifyError } = await supabase.functions.invoke(
-              "verify-razorpay-payment",
-              {
-                body: {
-                  razorpay_payment_id: response.razorpay_payment_id,
-                  razorpay_order_id: response.razorpay_order_id,
-                  razorpay_signature: response.razorpay_signature,
-                  orderReference: orderReference,
-                  idempotencyKey: idempotencyKey
-                }
-              }
-            );
-
-            if (verifyError || !verifyData?.success) {
-              console.error('[Checkout] Verification failed:', verifyError);
-              
-              // Update pending order status to failed
-              await supabase
-                .from('pending_orders')
-                .update({ 
-                  status: 'failed',
-                  razorpay_payment_id: response.razorpay_payment_id
-                })
-                .eq('order_reference', orderReference);
-              
-              throw new Error('Payment verification failed');
-            }
-
-            // 3️⃣ Clear cart and redirect
-            console.log('[Checkout] Payment verified, clearing cart...');
-            await clearCart();
-            sessionStorage.removeItem('current_order');
-            navigate(`/order-success/${orderReference}`);
-            
-          } catch (err) {
-            console.error("[Checkout] Post-payment error:", err);
-            alert("Payment was successful but order confirmation failed. Our team will contact you soon.");
-          } finally {
-            setProcessingOrder(false);
+      // 3️⃣ THEN - Verify payment with Razorpay
+      console.log('[Checkout] Verifying payment...');
+      const { data: verifyData, error: verifyError } = await supabase.functions.invoke(
+        "verify-razorpay-payment",
+        {
+          body: {
+            razorpay_payment_id: response.razorpay_payment_id,
+            razorpay_order_id: response.razorpay_order_id,
+            razorpay_signature: response.razorpay_signature,
+            orderReference: orderReference,
+            idempotencyKey: idempotencyKey
           }
-        },
+        }
+      );
+
+      if (verifyError || !verifyData?.success) {
+        console.error('[Checkout] Verification failed:', verifyError);
+        
+        // Update order status to failed
+        await supabase
+          .from('orders')
+          .update({ 
+            payment_status: 'failed',
+            order_status: 'payment_failed',
+            razorpay_payment_id: response.razorpay_payment_id,
+            razorpay_order_id: response.razorpay_order_id
+          })
+          .eq('id', orderId);
+        
+        throw new Error('Payment verification failed');
+      }
+
+      // 4️⃣ Update order as paid
+      console.log('[Checkout] Updating order as paid...');
+      const { error: updateError } = await supabase
+        .from('orders')
+        .update({ 
+          payment_status: 'paid',
+          order_status: 'confirmed',
+          razorpay_payment_id: response.razorpay_payment_id,
+          razorpay_order_id: response.razorpay_order_id,
+          razorpay_signature: response.razorpay_signature
+        })
+        .eq('id', orderId);
+
+      if (updateError) {
+        throw new Error('Failed to update order status');
+      }
+
+      // 5️⃣ Clear cart and redirect
+      console.log('[Checkout] Payment complete, clearing cart...');
+      await clearCart();
+      sessionStorage.removeItem('current_order');
+      navigate(`/order-success/${orderReference}`);
+      
+    } catch (err) {
+      console.error("[Checkout] Post-payment error:", err);
+      alert("Payment was successful but order confirmation failed. Our team will contact you soon.");
+    }
+  },
 
         modal: {
           ondismiss: () => {
             console.log('[Checkout] Payment modal dismissed');
             setProcessingOrder(false);
-            
-            // Check if order was already created (maybe by webhook)
-            const currentOrder = sessionStorage.getItem('current_order');
-            if (currentOrder) {
-              const { orderReference } = JSON.parse(currentOrder);
-              checkPendingOrder(orderReference);
-            }
           }
         }
       };
